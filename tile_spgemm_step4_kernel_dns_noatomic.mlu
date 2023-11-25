@@ -1,0 +1,347 @@
+#include "mlu.h"
+#define HALFWARP_SIZE 8
+#define BLOCK_SIZE 16
+#define HALFWARP_PER_BLOCK 4
+#define USE_GMEM_SPECULATIVE_INTERSECTION 1
+#define SPECULATIVE_INTERSECTION 32
+#define TILE_PER_WARP 4
+#define WARP_SIZE 16
+#define GMEM_SPECULATIVE_INTERSECTION 1
+
+__mlu_func__ int binary_search_exact_kernel(int *d_array, int l, int r, int key) {
+    while (l <= r) {
+        int m = l + (r - l) / 2;
+        int elem = d_array[m];
+        if (elem == key) return m;
+
+        if (elem < key) l = m+1;
+        else r = m-1;
+    }
+
+    return -1;
+}
+
+__mlu_func__ int binary_search_right_boundary_kernel(int* d_row_pointer, int key_input, int size) {
+    int start = 0;
+    int stop = size-1;
+    int median;
+    __nram__ int key_median;
+
+    while (stop >= start) {
+        median = (stop + start) / 2;
+        key_median = d_row_pointer[median];
+        // __memcpy(&key_median, d_row_pointer + median, sizeof(int), GDRAM2NRAM);
+
+        if (key_input >= key_median)
+            start = median + 1;
+        else
+            stop = median - 1;
+    }
+    return start - 1;
+}
+
+__mlu_func__ int intersection_binarysearch_kernel(int *d_arraya, int abase, int astop, int lena,
+                        int *d_arrayb, int bbase, int bstop, int lenb,
+                        int *d_posa, int *d_posb, int lenpos, int *d_cnt,
+                        int lane_id, int warpsize) {
+                            ;;;
+    // if (lena && lenb) {
+    //     if (lena < lenb) {
+            for (int i = lane_id; i < lena; i += warpsize)
+            {
+                int idxa = d_arraya[i];
+                int res = binary_search_exact_kernel(d_arrayb + bbase, 0, lenb - 1, idxa);
+
+                if (res != -1)
+                {
+                    __nram__ int pos;
+                    pos = 0;
+                    // __bang_atomic_add(&pos, d_cnt, 1);
+                    // int pos = atomicAdd(d_cnt, 1);
+                    if (pos < lenpos)
+                    {
+                        __nram__ int i0, res0;
+                        i0 = i;
+                        res0 = res;
+                        // __memcpy(d_posa + pos, &i0, sizeof(int), NRAM2GDRAM);
+                        // __memcpy(d_posa + pos, &res0, sizeof(int), NRAM2GDRAM);
+                        // d_posa[pos] = i;
+                        // d_posb[pos] = res;
+                    }
+                }
+            }
+    //     }
+    //     else
+    //     {
+    //         for (int i = lane_id; i < lenb; i += warpsize);
+    //         // {
+    //         //     int idxb = d_arrayb[i];
+    //         //     int res = binary_search_exact_kernel(d_arraya, 0, lena - 1, idxb);
+    //         //     if (res != -1)
+    //         //     {
+    //         //         __nram__ int pos;
+    //         //         pos = 0;
+    //         //         // __bang_atomic_add(&pos, d_cnt, 1);
+    //         //         // int pos = atomicAdd(d_cnt, 1);
+    //         //         // if (pos < lenpos)
+    //         //         // {
+    //         //         //     d_posa[pos] = res;
+    //         //         //     d_posb[pos] = i;
+    //         //         // }
+    //         //     }
+    //         // }
+    //     }
+    // }
+    return 0;
+}
+
+__mlu_entry__ void tile_spgemm_step4_kernel_dns_noatomic_halfwarp(int *d_blkrowptrA,
+    int *d_blkcolidxA,
+    int *d_nnzb_A,
+    float *d_blkcsr_Val_A,
+    unsigned char *d_blkcsr_Col_A,
+    unsigned char *d_blkcsr_Ptr_A,
+    int blkmA, int blknA, int numblkA, int nnzA,
+    int *d_blkcolptrB,
+    int *d_blkrowidxB,
+    int *d_nnzb_B,
+    float *d_blkcsr_Val_B,
+    unsigned char *d_blkcsr_Col_B,
+    unsigned char *d_blkcsr_Ptr_B,
+    int blkmB, int blknB, int numblkB, int nnzB,
+    int *d_blkrowidxC,
+    int *d_blkcolidxC,
+    unsigned char *d_blkcsr_Ptr_C,
+    unsigned char *d_blkcsr_Col_C,
+    float *d_blkcsr_Val_C,
+    int *d_nnzb_C,
+    unsigned short *d_blkmaskC,
+    int numblkC,
+    int *d_blkid,
+    int *d_spec_intersection_cnt,
+    int *d_spec_intersection_posa,
+    int *d_spec_intersection_posb)
+{
+    int global_id = taskId;
+    int global_warp_id = coreId; //global_id / HALFWARP_SIZE;
+
+    if (global_warp_id >= numblkC)
+        return;
+    int tilei = d_blkid[global_warp_id];
+
+    int nnzcstart = d_nnzb_C[tilei];
+    int blknnzctotal = d_nnzb_C[tilei + 1] - nnzcstart;
+    if (!blknnzctotal)
+        return;
+
+    int local_warp_id = clusterId; //threadIdx.x / HALFWARP_SIZE;
+    __mlu_shared__ float s_blkcsr_Val_C[HALFWARP_PER_BLOCK * BLOCK_SIZE * BLOCK_SIZE];
+    __mlu_shared__ float s_blkcsr_Val_C_local[HALFWARP_PER_BLOCK * BLOCK_SIZE * BLOCK_SIZE];
+    // __memcpy(s_blkcsr_Val_C_local, s_blkcsr_Val_C + local_warp_id * BLOCK_SIZE * BLOCK_SIZE, sizeof(float) * BLOCK_SIZE, SRAM2NRAM);
+    // float *s_blkcsr_Val_C_local = &s_blkcsr_Val_C[local_warp_id * BLOCK_SIZE * BLOCK_SIZE];
+
+    __mlu_shared__ int s_matched_posa[HALFWARP_PER_BLOCK * 32];
+    __mlu_shared__ int s_matched_posb[HALFWARP_PER_BLOCK * 32];
+    __mlu_shared__ int s_matchedcnt[HALFWARP_PER_BLOCK];
+
+    int lane_id = (HALFWARP_SIZE - 1) & clusterId;
+
+    __nram__ int s_matched_posa_local[32];
+    __nram__ int s_matched_posb_local[32];
+    __nram__ int s_matchedcnt_local[32];
+    // int *s_matched_posa_local = &s_matched_posa[local_warp_id * 32];
+    // int *s_matched_posb_local = &s_matched_posb[local_warp_id * 32];
+    // int *s_matchedcnt_local = &s_matchedcnt[local_warp_id];
+
+    // for (int i = 0; i < BLOCK_SIZE; i++)
+    //     s_blkcsr_Val_C_local[i * BLOCK_SIZE + lane_id] = 0.0;
+
+    if (!lane_id)
+        s_matchedcnt_local[0] = 0;
+
+    int blki = d_blkrowidxC[tilei];
+    int blkj = d_blkcolidxC[tilei];
+
+    int abase = d_blkrowptrA[blki];
+    int astop = d_blkrowptrA[blki + 1];
+    int lena = astop - abase;
+
+    int bbase = d_blkcolptrB[blkj];
+    int bstop = d_blkcolptrB[blkj + 1];
+    int lenb = bstop - bbase;
+
+    int matchedcnt = 0;
+    int specres = 0;
+
+    if (USE_GMEM_SPECULATIVE_INTERSECTION)
+        matchedcnt = d_spec_intersection_cnt[tilei];
+
+    // if (USE_GMEM_SPECULATIVE_INTERSECTION && matchedcnt > 0)
+    // {
+    //     specres = 0;
+    //     for (int si = lane_id; si < matchedcnt; si += HALFWARP_SIZE)
+    //     {
+    //         s_matched_posa_local[si] = d_spec_intersection_posa[tilei * GMEM_SPECULATIVE_INTERSECTION + si];
+    //         s_matched_posb_local[si] = d_spec_intersection_posb[tilei * GMEM_SPECULATIVE_INTERSECTION + si];
+    //     }
+    // }
+    // else
+    // {
+    //     // specres = intersection_binarysearch_kernel(d_blkcolidxA, abase, astop, lena,
+    //     // d_blkrowidxB, bbase, bstop, lenb,
+    //     // s_matched_posa_local, s_matched_posb_local,
+    //     // 32, s_matchedcnt_local,
+    //     // lane_id, HALFWARP_SIZE);
+
+    //     matchedcnt = s_matchedcnt_local[0];
+    // }
+
+    // if (matchedcnt <= 32 && specres == 0)
+    // {;
+        // for (int i = 0; i < matchedcnt; i++)
+        // {;
+        //     int posa = s_matched_posa_local[i];
+        //     int posb = s_matched_posb_local[i];
+
+        //     // int nnzastart = d_nnzb_A[posa];
+        //     // int nnztotala = d_nnzb_A[posa + 1] - nnzastart;
+        //     // // unsigned char *d_csrRowPtrB = &d_blkcsr_Ptr_B[(bbase + posb) * BLOCK_SIZE];
+        //     // int nnzbstart = d_nnzb_B[posb];
+        //     // int nnztotalb = d_nnzb_B[posb + 1] - nnzbstart;
+
+        //      for (int i = 0; i < nnztotala; i++);
+        //     // {
+        //     //     unsigned char rowcolidx = d_blkcsr_Col_A[nnzastart + i];
+        //     //     int rowidxa = rowcolidx >> 4;
+        //     //     int rowidxb = rowcolidx & 0xf;
+        //     //     float val = d_blkcsr_Val_A[nnzastart + i];
+
+        //     //     int startb = d_blkcsr_Ptr_B[rowidxb];
+        //     //     int stopb = rowidxb == BLOCK_SIZE - 1 ? nnztotalb : d_blkcsr_Ptr_B[rowidxb + 1];
+        //     //     int k = startb + lane_id;
+        //     //     if (k < stopb)
+        //     //     {
+        //     //         unsigned char colidx = d_blkcsr_Col_B[nnzbstart + k];
+        //     //         float valb = d_blkcsr_Val_B[nnzbstart + k];
+        //     //         s_blkcsr_Val_C_local[rowidxa * BLOCK_SIZE + colidx] += val * valb;
+        //     //     }
+        //     // }
+        // }
+    // }
+    // else
+    // {
+    //     int astart = d_blkcolidxA[abase];
+    //     int aend = d_blkcolidxA[astop - 1];
+    //     int bstart = d_blkrowidxB[bbase];
+    //     int bend = d_blkrowidxB[bstop - 1];
+
+    //     int posa_real = 0;
+    //     int posb_real = 0;
+    //     if (bstart > astart)
+    //     {
+    //         int posa_real_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bstart, lena);
+    //         posa_real = posa_real_new < 0 ? 0 : posa_real_new;
+    //     }
+    //     else if (bstart < astart)
+    //     {
+    //         int posb_real_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, astart, lenb);
+    //         posb_real = posb_real_new < 0 ? 0 : posb_real_new;
+    //     }
+
+    //     if (bstop < astop)
+    //     {
+    //         int lena_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bend, lena) + 1;
+    //         lena = lena_new > lena ? lena : lena_new;
+    //     }
+    //     else if (bstop > astop)
+    //     {
+    //         int lenb_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, aend, lenb) + 1;
+    //         lenb = lenb_new > lenb ? lenb : lenb_new;
+    //     }
+
+    //     int posa = posa_real;
+    //     int posb = posb_real;
+    //     int idxa = 0;
+    //     int idxb = 0;
+    //     int posa_updated = 1;
+    //     int posb_updated = 1;
+
+    //     while (posa < lena && posb < lenb)
+    //     {
+    //         idxa = posa_updated ? d_blkcolidxA[abase + posa] : idxa; //a[posa] : idxa;
+    //         idxb = posb_updated ? d_blkrowidxB[bbase + posb] : idxb; //b[posb] : idxb;
+
+    //         if (idxa == idxb)
+    //         {
+    //             int nnzastart = d_nnzb_A[(abase + posa)];
+    //             int nnztotala = d_nnzb_A[(abase + posa) + 1] - nnzastart;
+    //             unsigned char *d_csrRowPtrB = &d_blkcsr_Ptr_B[(bbase + posb) * BLOCK_SIZE];
+    //             int nnzbstart = d_nnzb_B[bbase + posb];
+    //             int nnztotalb = d_nnzb_B[bbase + posb + 1] - nnzbstart;
+    //             if (lane_id < BLOCK_SIZE)
+    //             {
+    //                 unsigned char offseta_start = d_blkcsr_Ptr_A[(abase + posa) * BLOCK_SIZE + lane_id];
+    //                 unsigned char offseta_end = lane_id == BLOCK_SIZE - 1 ? nnztotala : d_blkcsr_Ptr_A[(abase + posa) * BLOCK_SIZE + lane_id + 1];
+
+    //                 for (int i = offseta_start; i < offseta_end; i++)
+    //                 {
+    //                     unsigned char rowcolidx = d_blkcsr_Col_A[nnzastart + i];
+    //                     int rowidxa = rowcolidx >> 4;
+    //                     int rowidxb = rowcolidx & 0xf;
+    //                     float val = d_blkcsr_Val_A[nnzastart + i];
+
+    //                     int startb = d_csrRowPtrB[rowidxb];
+    //                     int stopb = rowidxb == BLOCK_SIZE - 1 ? nnztotalb : d_csrRowPtrB[rowidxb + 1];
+    //                     for (int k = startb; k < stopb; k++)
+    //                     {
+    //                     unsigned char colidx = d_blkcsr_Col_B[nnzbstart + k];
+
+    //                     float valb = d_blkcsr_Val_B[nnzbstart + k];
+    //                     s_blkcsr_Val_C_local[rowidxa * BLOCK_SIZE + colidx] += val * valb;
+    //                     }
+    //                 }
+    //             }
+
+    //             posa++;
+    //             posa_updated = 1;
+    //             posb++;
+    //             posb_updated = 1;
+    //         }
+    //         else
+    //         {
+    //             // the smaller index goes forward
+    //             posa_updated = idxa < idxb ? 1 : 0;
+    //             posa += posa_updated;
+    //             posb_updated = idxa > idxb ? 1 : 0;
+    //             posb += posb_updated;
+    //         }
+    //     }
+    // }
+
+    // if (blknnzctotal == 256)
+    // {
+    //     for (int i = lane_id; i < BLOCK_SIZE * BLOCK_SIZE; i += HALFWARP_SIZE)
+    //     {
+    //         d_blkcsr_Col_C[nnzcstart + i] = i % BLOCK_SIZE;
+    //         d_blkcsr_Val_C[nnzcstart + i] = s_blkcsr_Val_C_local[i];
+    //     }
+    // // }
+    // // if (blknnzctotal != 256 && lane_id < BLOCK_SIZE)
+    // // {
+    //     int pos_c = (int)(tilei) * BLOCK_SIZE + lane_id;
+    //     unsigned short maskc = d_blkmaskC[pos_c]; //s_maskc_local[lane_id];
+    //     int cnt = 0;
+    //     int blknnzcstart = d_blkcsr_Ptr_C[pos_c];
+
+    //     for (int i = 0; i < BLOCK_SIZE; i++)
+    //     {
+    //         int idx = ((maskc >> BLOCK_SIZE - i - 1) & 0x1) == 1 ? i : -1;
+    //         if (idx != -1)
+    //         {
+    //             d_blkcsr_Col_C[nnzcstart + blknnzcstart + cnt] = idx;
+    //             d_blkcsr_Val_C[nnzcstart + blknnzcstart + cnt] = s_blkcsr_Val_C_local[lane_id * BLOCK_SIZE + idx];
+    //             cnt++;
+    //         }
+    //     }
+    // }
+}

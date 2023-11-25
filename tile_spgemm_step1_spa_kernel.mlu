@@ -1,0 +1,60 @@
+#include "mlu.h"
+
+#define WARP_PER_BLOCK 4
+#define WARP_SIZE 4
+#define SPA_INT_PER_WARP 512
+
+__mlu_func__ int __ceil(float x) {
+    if (x == (int)x) return (int)x;
+    else if (x > 0) return (int)x + 1;
+    else return (int)x;
+}
+
+__mlu_func__ int popc(unsigned int x) {
+    int res = 0;
+    while (x) {
+        res += x & 1;
+        x >>= 1;
+    }
+    return res;
+}
+
+__mlu_entry__ void tile_spgemm_step1_spa_kernel(int *d_blkrowptrA, int *d_blkcolidxA, int blkmA,
+                                                int *d_blkrowptrB, int *d_blkcolidxB, int blknB, int *d_blkrowptrC) {
+    int global_id = taskId;
+    int global_warp_id = clusterId * 4 + coreId;
+    __mlu_shared__ unsigned int bitmask[WARP_PER_BLOCK * SPA_INT_PER_WARP];
+    
+    if (global_warp_id >= blkmA) return;
+    int nmasks = __ceil((float)blknB / 32);
+    int local_warp_id = coreId;
+    int lane_id = coreId;
+    __nram__ unsigned int bitmask_local[SPA_INT_PER_WARP];
+    __memcpy(bitmask_local, bitmask + local_warp_id * SPA_INT_PER_WARP, sizeof(int) * SPA_INT_PER_WARP, SRAM2NRAM);
+    // __nram__ unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];                                
+    for (int i = lane_id; i < nmasks; i += WARP_SIZE)
+        bitmask_local[i] = 0;
+    
+    int astart = d_blkrowptrA[global_warp_id];
+    int astop = d_blkrowptrA[global_warp_id + 1];
+    for (int i = astart; i < astop; ++i) {
+        int rowidx = d_blkcolidxA[i];
+        int bstart = d_blkrowptrB[rowidx];
+        int bstop = d_blkrowptrB[rowidx + 1];
+        for (int j = bstart + lane_id; j < bstop; j += WARP_SIZE) {
+            int colidx = d_blkcolidxB[j];
+            unsigned int mask = 1 << (31 - colidx % 32);
+            __ldram__ unsigned int t2;
+            // t1 = bitmask_local[colidx / 32], t2 = t1;
+            t2 = bitmask_local[colidx / 32];
+            __bang_atomic_or(&bitmask_local[colidx / 32], &t2, mask);
+            // bitmask_local[colidx / 32] = t1;
+        }
+    }
+
+    int cnt = 0;
+    for (int i = lane_id; i < nmasks; i += WARP_SIZE)
+        cnt += popc(bitmask_local[i]);
+    // cnt = sum_32_shfl(cnt);
+    if (!lane_id) d_blkrowptrC[global_warp_id] = cnt;
+}    

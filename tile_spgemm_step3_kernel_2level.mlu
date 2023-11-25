@@ -1,0 +1,411 @@
+#include "mlu.h"
+#define WARP_PER_BLOCK 4
+#define BLOCK_SIZE 16
+#define SPECULATIVE_INTERSECTION 32
+#define TILE_PER_WARP 4
+#define WARP_SIZE 16
+
+__mlu_func__ int binary_search_exact_kernel(int *d_array, int l, int r, int key) {
+    while (l <= r) {
+        int m = l + (r - l) / 2;
+        int elem = d_array[m];
+        if (elem == key) return m;
+
+        if (elem < key) l = m+1;
+        else r = m-1;
+    }
+
+    return -1;
+}
+
+__mlu_func__ int binary_search_right_boundary_kernel(int* d_row_pointer, int key_input, int size) {
+    int start = 0;
+    int stop = size-1;
+    int median;
+    __nram__ int key_median;
+
+    while (stop >= start) {
+        median = (stop + start) / 2;
+        key_median = d_row_pointer[median];
+        // __memcpy(&key_median, d_row_pointer + median, sizeof(int), GDRAM2NRAM);
+
+        if (key_input >= key_median)
+            start = median + 1;
+        else
+            stop = median - 1;
+    }
+    return start - 1;
+}
+
+__mlu_func__ int intersection_binarysearch_kernel(int *d_arraya, int abase, int astop, int lena,
+                        int *d_arrayb, int bbase, int bstop, int lenb,
+                        int *d_posa, int *d_posb, int lenpos, int *d_cnt,
+                        int lane_id, int warpsize) {
+    if (lena && lenb) {
+        if (lena < lenb) {
+            for (int i = lane_id; i < lena; i += warpsize)
+            {
+                int idxa = d_arraya[abase + i];
+                int res = binary_search_exact_kernel(d_arrayb + bbase, 0, lenb - 1, idxa);
+
+                if (res != -1)
+                {
+                    __nram__ int pos;
+                    pos = 0;
+                    // __bang_atomic_add(&pos, d_cnt, 1);
+                    // int pos = atomicAdd(d_cnt, 1);
+                    if (pos < lenpos)
+                    {
+                        __nram__ int i0, res0;
+                        i0 = i;
+                        res0 = res;
+                        // __memcpy(d_posa + pos, &i0, sizeof(int), NRAM2GDRAM);
+                        // __memcpy(d_posa + pos, &res0, sizeof(int), NRAM2GDRAM);
+                        // d_posa[pos] = i;
+                        // d_posb[pos] = res;
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int i = lane_id; i < lenb; i += warpsize)
+            {
+                int idxb = d_arrayb[i];
+                int res = binary_search_exact_kernel(d_arraya, 0, lena - 1, idxb);
+                if (res != -1)
+                {
+                    __nram__ int pos;
+                    pos = 0;
+                    // __bang_atomic_add(&pos, d_cnt, 1);
+                    // int pos = atomicAdd(d_cnt, 1);
+                    // if (pos < lenpos)
+                    // {
+                    //     d_posa[pos] = res;
+                    //     d_posb[pos] = i;
+                    // }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+__mlu_entry__ void tile_spgemm_step3_kernel_2level(int *d_blkrowptrA,
+    int *d_blkcolidxA,
+    int *d_nnzb_A,
+    float *d_blkcsr_Val_A,
+    unsigned char *d_blkcsr_Col_A,
+    unsigned char *d_blkcsr_Ptr_A,
+    unsigned short *d_blkmaskA,
+    int blkmA, int blknA, int numblkA, int nnzA,
+    int *d_blkcolptrB,
+    int *d_blkrowidxB,
+    int *d_nnzb_B,
+    float *d_blkcsr_Val_B,
+    unsigned char *d_blkcsr_Col_B,
+    unsigned char *d_blkcsr_Ptr_B,
+    unsigned short *d_blkmaskB,
+    int blkmB, int blknB, int numblkB, int nnzB,
+    int *d_blkrowidxC,
+    int *d_blkcolidxC,
+    unsigned char *d_blkcsr_Ptr_C,
+    int *d_nnzb_C,
+    unsigned short *d_blkmaskC,
+    int *d_blksmem_tny_cnt,
+    int *d_blksmem_sml_cnt,
+    int *d_blksmem_lrg_cnt,
+    int *d_blksmem_dns_cnt,
+    int *d_blksmem_ful_cnt,
+    int *d_blkid_smem_tny,
+    int *d_blkid_smem_sml,
+    int *d_blkid_smem_lrg,
+    int *d_blkid_smem_dns,
+    int *d_blkid_smem_ful,
+    int numblkC) {
+
+    int global_id = taskId;
+    int global_warp_id = coreId;
+
+    __mlu_shared__ unsigned int s_maskc[WARP_PER_BLOCK * BLOCK_SIZE];
+    __mlu_shared__ unsigned short s_blkmaskB[WARP_PER_BLOCK * BLOCK_SIZE];
+
+    __mlu_shared__ int s_matched_posa[WARP_PER_BLOCK * SPECULATIVE_INTERSECTION];
+    __mlu_shared__ int s_matched_posb[WARP_PER_BLOCK * SPECULATIVE_INTERSECTION];
+    __mlu_shared__ int s_matchedcnt[WARP_PER_BLOCK];
+
+    __mlu_shared__ int s_blksmem_tny_cnt[WARP_PER_BLOCK];
+    __mlu_shared__ int s_blksmem_sml_cnt[WARP_PER_BLOCK];
+    __mlu_shared__ int s_blksmem_lrg_cnt[WARP_PER_BLOCK];
+    __mlu_shared__ int s_blksmem_dns_cnt[WARP_PER_BLOCK];
+    __mlu_shared__ int s_blksmem_ful_cnt[WARP_PER_BLOCK];
+
+    __mlu_shared__ int s_blkid_smem_tny[WARP_PER_BLOCK * TILE_PER_WARP];
+    __mlu_shared__ int s_blkid_smem_sml[WARP_PER_BLOCK * TILE_PER_WARP];
+    __mlu_shared__ int s_blkid_smem_lrg[WARP_PER_BLOCK * TILE_PER_WARP];
+    __mlu_shared__ int s_blkid_smem_dns[WARP_PER_BLOCK * TILE_PER_WARP];
+    __mlu_shared__ int s_blkid_smem_ful[WARP_PER_BLOCK * TILE_PER_WARP];
+
+    int lane_id = (WARP_SIZE - 1) & clusterId;
+    int local_warp_id = coreId;
+
+    unsigned int *s_maskc_local = &s_maskc[local_warp_id * BLOCK_SIZE];
+    __nram__ unsigned short s_blkmaskB_local[BLOCK_SIZE];
+    __memcpy(s_blkmaskB_local, s_blkmaskB + local_warp_id * BLOCK_SIZE, sizeof(unsigned short) * BLOCK_SIZE, SRAM2NRAM);
+    //unsigned short *s_blkmaskB_local = &s_blkmaskB[local_warp_id * BLOCK_SIZE];
+
+    int *s_matched_posa_local = &s_matched_posa[local_warp_id * SPECULATIVE_INTERSECTION];
+    int *s_matched_posb_local = &s_matched_posb[local_warp_id * SPECULATIVE_INTERSECTION];
+    int *s_matchedcnt_local = &s_matchedcnt[local_warp_id];
+
+    int *s_blksmem_tny_cnt_local = &s_blksmem_tny_cnt[local_warp_id];
+    int *s_blksmem_sml_cnt_local = &s_blksmem_sml_cnt[local_warp_id];
+    int *s_blksmem_lrg_cnt_local = &s_blksmem_lrg_cnt[local_warp_id];
+    int *s_blksmem_dns_cnt_local = &s_blksmem_dns_cnt[local_warp_id];
+    int *s_blksmem_ful_cnt_local = &s_blksmem_ful_cnt[local_warp_id];
+
+    int *s_blkid_smem_tny_local = &s_blkid_smem_tny[local_warp_id * TILE_PER_WARP];
+    int *s_blkid_smem_sml_local = &s_blkid_smem_sml[local_warp_id * TILE_PER_WARP];
+    int *s_blkid_smem_lrg_local = &s_blkid_smem_lrg[local_warp_id * TILE_PER_WARP];
+    int *s_blkid_smem_dns_local = &s_blkid_smem_dns[local_warp_id * TILE_PER_WARP];
+    int *s_blkid_smem_ful_local = &s_blkid_smem_ful[local_warp_id * TILE_PER_WARP];
+
+    int tile_start = global_warp_id * TILE_PER_WARP;
+    if (tile_start >= numblkC) return;
+
+    int tile_end = tile_start + TILE_PER_WARP;
+    tile_end = tile_end >= numblkC ? numblkC : tile_end;
+
+    if (!lane_id) {
+        s_blksmem_tny_cnt_local[0] = 0;
+        s_blksmem_sml_cnt_local[0] = 0;
+        s_blksmem_lrg_cnt_local[0] = 0;
+        s_blksmem_dns_cnt_local[0] = 0;
+        s_blksmem_ful_cnt_local[0] = 0;
+    }
+
+    for (int tilei = tile_start; tilei < tile_end; ++tilei) {
+        if (lane_id < BLOCK_SIZE) s_maskc_local[lane_id] = 0;
+        if (!lane_id) s_matchedcnt_local[0] = 0;
+
+        int blki = d_blkrowidxC[tilei];
+        int blkj = d_blkcolidxC[tilei];
+
+        int abase = d_blkrowptrA[blki];
+        int astop = d_blkrowptrA[blki + 1];
+        int lena = astop - abase;
+
+        __nram__ int bbase;
+        __memcpy(&bbase, d_blkcolptrB + blkj, sizeof(int), GDRAM2NRAM);
+        __nram__ int bstop;
+        __memcpy(&bstop, d_blkcolptrB + blkj + 1, sizeof(int), GDRAM2NRAM);
+
+        int lenb = bstop - bbase;
+
+        if (lena == blknA && lenb == blkmB) {
+            for (int i = 0; i < lena; ++i) {
+                int posa = i;
+                int posb = i;
+
+                // if (lane_id < BLOCK_SIZE)
+                //     s_blkmaskB_local[lane_id] = d_blkmaskB[lane_id];
+                //     __memcpy(s_blkmaskB_local + lane_id, d_blkmaskB + (bbase + posb) * BLOCK_SIZE + lane_id, sizeof(unsigned short), GDRAM2SRAM);
+
+                int nnzastart = d_nnzb_A[posa];
+                int nnztotala = d_nnzb_A[posa + 1] - nnzastart;
+
+                for (int i = lane_id; i < nnztotala; i += WARP_SIZE) {
+                    unsigned char rowcolidx = d_blkcsr_Col_A[nnzastart + i];
+                    unsigned int maskb = s_blkmaskB_local[rowcolidx & 0xf];
+                    unsigned int t = s_maskc_local[rowcolidx >> 4];
+                    // s_maskc_local[rowcolidx >> 4] = t | maskb;
+                    // t = (t | maskb);
+                    // __ldram__ unsigned int t2;
+                    // __memcpy(&t2, s_maskc_local + (rowcolidx >> 4), sizeof(unsigned int), SRAM2LDRAM);
+                    // // t2 = s_maskc_local[rowcolidx >> 4];
+                    // __bang_atomic_or(&t, &t2, maskb);
+                    // s_maskc_local[rowcolidx >> 4] = t;
+                }
+            }
+        } else if (lena == blknA && lenb != blkmB) {
+            for (int i = 0; i < lenb; i++)
+            {
+                int posb = d_blkrowidxB[bbase + i];
+                int posa = posb;
+
+                // if (lane_id < BLOCK_SIZE)
+                // {
+                //     __memcpy(s_blkmaskB_local + lane_id, d_blkmaskB + (bbase + posb) * BLOCK_SIZE + lane_id, sizeof(unsigned short), GDRAM2SRAM);
+                //     // s_blkmaskB_local[lane_id] = ld_gbl_ushort(&d_blkmaskB[(bbase + posb) * BLOCK_SIZE + lane_id]);
+                // }
+
+                int nnzastart = d_nnzb_A[posa];
+                int nnztotala = d_nnzb_A[posa + 1] - nnzastart;
+
+                for (int i = lane_id; i < nnztotala; i += WARP_SIZE)
+                {
+                    unsigned char rowcolidx = d_blkcsr_Col_A[nnzastart + i];
+                    unsigned int maskb = s_blkmaskB_local[rowcolidx & 0xf];
+                    __nram__ unsigned int t;
+                    t = s_maskc_local[rowcolidx >> 4];
+                    // __ldram__ unsigned int t2;
+                    // t2 = s_maskc_local[rowcolidx >> 4];
+                   // __bang_atomic_or(&t, &t2, maskb);
+                    // atomicOr(&s_maskc_local[rowcolidx >> 4], maskb);
+                    s_maskc_local[rowcolidx >> 4] = t;
+                }
+            }
+
+        } else if (lena != blknA && lenb == blkmB) {
+            for (int i = 0; i < lenb; i++)
+            {
+                int posa = d_blkcolidxA[i];
+                int posb = posa;
+
+                // if (lane_id < BLOCK_SIZE)
+                // {
+                //     __memcpy(s_blkmaskB_local + lane_id, d_blkmaskB + (bbase + posb) * BLOCK_SIZE + lane_id, sizeof(unsigned short), GDRAM2SRAM);
+                //     // s_blkmaskB_local[lane_id] = ld_gbl_ushort(&d_blkmaskB[(bbase + posb) * BLOCK_SIZE + lane_id]);
+                // }
+
+                int nnzastart = d_nnzb_A[posa];
+                int nnztotala = d_nnzb_A[posa + 1] - nnzastart;
+
+                for (int i = lane_id; i < nnztotala; i += WARP_SIZE)
+                {
+                    ;
+                    // unsigned char rowcolidx = d_blkcsr_Col_A[nnzastart + i];
+                    // unsigned int maskb = s_blkmaskB_local[rowcolidx & 0xf];
+                    // __ldram__ unsigned int t2;
+                    // t2 = s_maskc_local[rowcolidx >> 4];
+                    // __bang_atomic_or(&t, &t2, maskb);
+                    // atomicOr(&s_maskc_local[rowcolidx >> 4], maskb);
+                }
+            }
+
+        }
+        else {
+            int specres = intersection_binarysearch_kernel(d_blkcolidxA, abase, astop, lena,
+                d_blkrowidxB, bbase, bstop, lenb,
+                s_matched_posa_local, s_matched_posb_local,
+                SPECULATIVE_INTERSECTION, s_matchedcnt_local,
+                lane_id, WARP_SIZE);
+
+            int matchedcnt = s_matchedcnt_local[0];
+
+            if (matchedcnt <= SPECULATIVE_INTERSECTION && specres == 0)
+            {
+                for (int i = 0; i < matchedcnt; i++)
+                {
+                    int posa = s_matched_posa_local[i];
+                    int posb = s_matched_posb_local[i];
+
+                    // if (lane_id < BLOCK_SIZE)
+                    // {
+                    //     __memcpy(s_blkmaskB_local + lane_id, d_blkmaskB + (bbase + posb) * BLOCK_SIZE + lane_id, sizeof(unsigned short), GDRAM2SRAM);
+                    //     // s_blkmaskB_local[lane_id] = ld_gbl_ushort(&d_blkmaskB[(bbase + posb) * BLOCK_SIZE + lane_id]);
+                    // }
+
+                    int nnzastart = d_nnzb_A[posa];
+                    int nnztotala = d_nnzb_A[posa + 1] - nnzastart;
+
+                    for (int li = lane_id; li < nnztotala; li += WARP_SIZE)
+                    {
+                        unsigned char rowcolidx = d_blkcsr_Col_A[nnzastart + li];
+                        unsigned int maskb = s_blkmaskB_local[rowcolidx & 0xf];
+                        __nram__ unsigned int t;
+                        t = s_maskc_local[rowcolidx >> 4];
+                        // __ldram__ unsigned int t2;
+                        // t2 = s_maskc_local[rowcolidx >> 4];
+                        // __bang_atomic_or(&t, &t2, maskb);
+                        // atomicOr(&s_maskc_local[rowcolidx >> 4], maskb);
+                        s_maskc_local[rowcolidx >> 4] = t;
+                    }
+                }
+            }
+            else
+            {
+                __nram__ int astart;
+                __nram__ int aend;
+                __nram__ int bstart;
+                __nram__ int bend;
+                astart = d_blkcolidxA[0];
+                aend = d_blkcolidxA[astop - 1];
+
+                bstart = d_blkrowidxB[bbase];
+                bend = d_blkrowidxB[bstop - 1];
+                // __memcpy(&bstart, d_blkrowidxB + bbase, sizeof(int), GDRAM2NRAM);
+                // __memcpy(&bend, d_blkrowidxB + bstop - 1, sizeof(int), GDRAM2NRAM);
+                // bstart = ld_gbl_int32(d_blkrowidxB + bbase);
+                // bend = ld_gbl_int32(d_blkrowidxB + bstop - 1);
+
+                int posa_real = 0;
+                int posb_real = 0;
+                // __bang_printf("bstart = %d\n", bstart);
+                // if (bstart > astart)
+                // {
+                //     // int posa_real_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bstart, lena);
+                //     // int posa_real_new = 0;
+                //     ;
+                //     // posa_real = posa_real_new < 0 ? 0 : posa_real_new;
+                // }
+                // else if (bstart < astart)
+                // {
+                //     int posb_real_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, astart, lenb);
+                //     posb_real = posb_real_new < 0 ? 0 : posb_real_new;
+                // }
+
+                // if (bstop < astop)
+                // {
+                //     int lena_new = binary_search_right_boundary_kernel(d_blkcolidxA + abase, bend, lena) + 1;
+                //     lena = lena_new > lena ? lena : lena_new;
+                // }
+                // else if (bstop > astop)
+                // {
+                //     int lenb_new = binary_search_right_boundary_kernel(d_blkrowidxB + bbase, aend, lenb) + 1;
+                //     lenb = lenb_new > lenb ? lenb : lenb_new;
+                // }
+
+                for (int posa = 0; posa < lena; posa++)
+                {
+                    int idxa = d_blkcolidxA[abase + posa];
+                    int posb = binary_search_right_boundary_kernel(d_blkrowidxB + bbase + posb_real, idxa, lenb - posb_real);
+                    // if (posb < 0)
+                    //     continue;
+                    // if (posb > lenb - posb_real)
+                    //     break;
+                    int idxb = d_blkrowidxB[bbase + posb_real + posb];
+                    // __memcpy(&idxb, d_blkrowidxB + bbase + posb_real + posb, sizeof(int), GDRAM2NRAM);
+                    // int idxb = ld_gbl_int32(d_blkrowidxB + bbase + posb_real + posb);
+
+                    if (idxa == idxb)
+                    {;
+                        // posb_real = posb_real + posb;
+                        // if (lane_id < BLOCK_SIZE)
+                        // {
+                        //     __memcpy(s_blkmaskB_local + lane_id, d_blkmaskB + (bbase + posb_real) * BLOCK_SIZE + lane_id, sizeof(unsigned short), GDRAM2SRAM);
+                        //     // s_blkmaskB_local[lane_id] = ld_gbl_ushort(d_blkmaskB + (bbase + posb_real) * BLOCK_SIZE + lane_id);
+                        // }
+
+                        // int nnzastart = 0;//  = d_nnzb_A[posa];
+                        // int nnztotala = 1; //d_nnzb_A[posa + 1] - nnzastart;
+
+                        // for (int i = lane_id; i < nnztotala; i += WARP_SIZE)
+                        // {
+                        //     unsigned char rowcolidx = d_blkcsr_Col_A[nnzastart + i];
+                        //     unsigned int maskb = s_blkmaskB_local[rowcolidx & 0xf];
+                        //     __nram__ unsigned int t;
+                        //     t = s_maskc_local[rowcolidx >> 4];
+                        //     // __ldram__ unsigned int t2;
+                        //     // t2 = s_maskc_local[rowcolidx >> 4];
+                        //     // __bang_atomic_or(&t, &t2, maskb);
+                        //     // atomicOr(&s_maskc_local[rowcolidx >> 4], maskb);
+                        //     s_maskc_local[rowcolidx >> 4] = t;
+                        // }
+                    }
+                }
+            }
+
+        }
+    }
+}

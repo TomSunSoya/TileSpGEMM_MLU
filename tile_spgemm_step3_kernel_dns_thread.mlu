@@ -1,0 +1,169 @@
+#include "mlu.h"
+#define BLOCK_SIZE 16
+#define SMEM_TNY_TH 32
+#define SMEM_SML_TH 32
+#define SMEM_LRG_TH 224
+#define SMEM_DNS_TH 256
+#define USE_GMEM_SPECULATIVE_INTERSECTION 1
+#define GMEM_SPECULATIVE_INTERSECTION 1
+
+__mlu_func__ int popc(unsigned int x) {
+    int res = 0;
+    while (x) {
+        res += x & 1;
+        x >>= 1;
+    }
+    return res;
+}
+
+__mlu_entry__ void tile_spgemm_step3_kernel_dns_thread( int *d_blkrowptrA,
+                                                     int *d_blkcolidxA,
+                                                     int *d_nnzb_A,
+                                                    float *d_blkcsr_Val_A,
+                                                    unsigned char *d_blkcsr_Col_A,
+                                                    unsigned char *d_blkcsr_Ptr_A,
+                                                    unsigned short *d_blkmaskA,
+                                                    int blkmA, int blknA, int numblkA, int nnzA,
+                                                     int *d_blkcolptrB,
+                                                     int *d_blkrowidxB,
+                                                     int *d_nnzb_B,
+                                                     float *d_blkcsr_Val_B,
+                                                     unsigned char *d_blkcsr_Col_B,
+                                                     unsigned char *d_blkcsr_Ptr_B,
+                                                     unsigned short *d_blkmaskB,
+                                                    int blkmB, int blknB, int numblkB, int nnzB,
+                                                    unsigned int *d_blk_intersec_bitmask_A,
+                                                    unsigned int *d_blk_intersec_bitmask_B,
+                                                    int blk_intersec_bitmask_len,
+                                                    int *d_blkrowidxC,
+                                                    int *d_blkcolidxC,
+                                                    unsigned char *d_blkcsr_Ptr_C,
+                                                    int *d_nnzb_C,
+                                                    unsigned short *d_blkmaskC,
+                                                    int *d_blksmem_tny_cnt,
+                                                    int *d_blksmem_sml_cnt,
+                                                    int *d_blksmem_lrg_cnt,
+                                                    int *d_blksmem_dns_cnt,
+                                                    int *d_blksmem_ful_cnt,
+                                                    int *d_blkid_smem_tny,
+                                                    int *d_blkid_smem_sml,
+                                                    int *d_blkid_smem_lrg,
+                                                    int *d_blkid_smem_dns,
+                                                    int *d_blkid_smem_ful,
+                                                    int *d_spec_intersection_cnt,
+                                                    int *d_spec_intersection_posa,
+                                                    int *d_spec_intersection_posb,
+                                                    int numblkC) {
+     int tilei = taskId;
+    __nram__ unsigned short maskb[BLOCK_SIZE];
+    __nram__ unsigned short maskc[BLOCK_SIZE];
+
+    __nramset(maskc, BLOCK_SIZE, 0);
+    if (tilei < numblkC) {
+        int matchedcnt = 0;
+
+         int blki = d_blkrowidxC[tilei];
+         int blkj = d_blkcolidxC[tilei];
+
+         int abase = d_blkrowptrA[blki];
+        __nram__ int bbase;
+        __memcpy(&bbase, d_blkcolptrB + blkj, sizeof(int), GDRAM2NRAM);
+
+        int offseta = 0;
+        int offsetb = 0;
+
+        for (int di = 0; di < blk_intersec_bitmask_len; ++di) {
+            unsigned int bma = d_blk_intersec_bitmask_A[blki *blk_intersec_bitmask_len + di];
+            unsigned int bmb = d_blk_intersec_bitmask_B[blkj *blk_intersec_bitmask_len + di];
+
+            int posa = offseta;
+            int posb = offsetb;
+
+            // __popc返回二进制中1的个数
+            int temp = bma & bmb;
+            if (popc(temp)) {
+                for (int ii = 31; ii >= 0; ii--) {
+                    unsigned int bita = (bma >> ii) & 0x1;
+                    unsigned int bitb = (bmb >> ii) & 0x1;
+
+                    if (bita && bitb) {
+                        if (USE_GMEM_SPECULATIVE_INTERSECTION && matchedcnt < GMEM_SPECULATIVE_INTERSECTION) {
+                            d_spec_intersection_cnt[tilei] = matchedcnt;
+                            d_spec_intersection_posa[tilei *GMEM_SPECULATIVE_INTERSECTION + matchedcnt] = posa;
+                            d_spec_intersection_posb[tilei *GMEM_SPECULATIVE_INTERSECTION + matchedcnt] = posb;
+                        }
+                        matchedcnt++;
+
+                        __nram__ int nnzastart;
+                        __memcpy(&nnzastart, d_nnzb_A + abase + posa, sizeof(int), GDRAM2NRAM);
+                        __nram__ int nnztotala;
+                        __memcpy(&nnztotala, d_nnzb_A + abase + posa + 1, sizeof(int), GDRAM2NRAM);
+                        nnztotala -= nnzastart;
+
+
+                        __memcpy(maskb, d_blkmaskB + (bbase + posb) *BLOCK_SIZE, sizeof(unsigned short) *BLOCK_SIZE, GDRAM2NRAM);
+                        // for (int ci = 0; ci < BLOCK_SIZE; ci++)
+                        //     maskb[ci] = ld_gbl_ushort(&d_blkmaskB[(bbase + posb) *BLOCK_SIZE + ci]);
+
+                        for (int ni = 0; ni < nnztotala; ni++) {
+                            __nram__ unsigned char rowcolidx;
+                            __memcpy(&rowcolidx, d_blkcsr_Col_A + nnzastart + ni, sizeof(unsigned char), GDRAM2NRAM);
+                            // unsigned char rowcolidx = ld_gbl_uchar(d_blkcsr_Col_A + nnzastart + ni);
+                            maskc[rowcolidx >> 4] |= maskb[rowcolidx & 0xf];
+                        }
+                    }
+
+                    posa += bita;
+                    posb += bitb;
+                }
+
+                offseta += popc(bma);
+                offsetb += popc(bmb);
+            }
+            
+            int nnzcnt_sum = 0;
+            int pos_c = (int) tilei *BLOCK_SIZE;
+            d_blkcsr_Ptr_C[pos_c] = 0;
+            d_blkmaskC[pos_c] = maskc[0];
+    
+            for (int ci = 1; ci < BLOCK_SIZE; ++ci) {
+                nnzcnt_sum += popc(maskc[ci - 1]);
+                pos_c = (int) tilei *BLOCK_SIZE + ci;
+                d_blkcsr_Ptr_C[pos_c] = nnzcnt_sum;
+                d_blkmaskC[pos_c] = maskc[ci];
+            }
+
+            nnzcnt_sum += popc(maskc[BLOCK_SIZE - 1]);
+
+            if (nnzcnt_sum)
+                d_nnzb_C[tilei] = nnzcnt_sum;
+            
+            if (nnzcnt_sum <= SMEM_TNY_TH && nnzcnt_sum != 0) {
+                __nram__ int pos;
+                __bang_atomic_add(&pos, d_blksmem_tny_cnt, 1);
+                // int pos = atomicAdd(d_blksmem_tny_cnt, 1);
+                d_blkid_smem_tny[pos] = tilei;
+            } else if (SMEM_TNY_TH < nnzcnt_sum && nnzcnt_sum <= SMEM_SML_TH) {
+                __nram__ int pos;
+                __bang_atomic_add(&pos, d_blksmem_sml_cnt, 1);
+                // int pos = atomicAdd(d_blksmem_sml_cnt, 1);
+                d_blkid_smem_sml[pos] = tilei;
+            } else if (SMEM_SML_TH < nnzcnt_sum && nnzcnt_sum <= SMEM_LRG_TH) {
+                __nram__ int pos;
+                __bang_atomic_add(&pos, d_blksmem_lrg_cnt, 1);
+                // int pos = atomicAdd(d_blksmem_lrg_cnt, 1);
+                d_blkid_smem_lrg[pos] = tilei;
+            } else if (SMEM_LRG_TH < nnzcnt_sum && nnzcnt_sum < SMEM_DNS_TH) {
+                __nram__ int pos;
+                __bang_atomic_add(&pos, d_blksmem_dns_cnt, 1);
+                // int pos = atomicAdd(d_blksmem_dns_cnt, 1);
+                d_blkid_smem_dns[pos] = tilei;
+            } else if (nnzcnt_sum == SMEM_DNS_TH) {
+                __nram__ int pos;
+                __bang_atomic_add(&pos, d_blksmem_ful_cnt, 1);
+                // int pos = atomicAdd(d_blksmem_ful_cnt, 1);
+                d_blkid_smem_ful[pos] = tilei;
+            }
+        }
+    }
+}
