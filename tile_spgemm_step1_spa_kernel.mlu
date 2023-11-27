@@ -31,7 +31,7 @@ __mlu_entry__ void tile_spgemm_step1_spa_kernel(int *d_blkrowptrA, int *d_blkcol
     int lane_id = coreId;
     __nram__ unsigned int bitmask_local[SPA_INT_PER_WARP];
     __memcpy(bitmask_local, bitmask + local_warp_id * SPA_INT_PER_WARP, sizeof(int) * SPA_INT_PER_WARP, SRAM2NRAM);
-    // __nram__ unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];                                
+    __nram__ unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];                                
     for (int i = lane_id; i < nmasks; i += WARP_SIZE)
         bitmask_local[i] = 0;
     
@@ -45,16 +45,16 @@ __mlu_entry__ void tile_spgemm_step1_spa_kernel(int *d_blkrowptrA, int *d_blkcol
             int colidx = d_blkcolidxB[j];
             unsigned int mask = 1 << (31 - colidx % 32);
             __ldram__ unsigned int t2;
-            // t1 = bitmask_local[colidx / 32], t2 = t1;
+            t1 = bitmask_local[colidx / 32], t2 = t1;
             t2 = bitmask_local[colidx / 32];
             __bang_atomic_or(&bitmask_local[colidx / 32], &t2, mask);
-            // bitmask_local[colidx / 32] = t1;
+            bitmask_local[colidx / 32] = t1;
         }
     }
 
     int cnt = 0;
     for (int i = lane_id; i < nmasks; i += WARP_SIZE)
         cnt += popc(bitmask_local[i]);
-    // cnt = sum_32_shfl(cnt);
+    cnt = sum_32_shfl(cnt);
     if (!lane_id) d_blkrowptrC[global_warp_id] = cnt;
 }    

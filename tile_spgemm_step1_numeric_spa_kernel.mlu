@@ -34,7 +34,7 @@ __mlu_entry__ void tile_spgemm_step1_numeric_spa_kernel(int *d_blkrowptrA, int *
     int lane_id = coreId;
     __nram__ unsigned int bitmask_local[SPA_INT_PER_WARP];
     __memcpy(bitmask_local, bitmask + local_warp_id * SPA_INT_PER_WARP, sizeof(int) * SPA_INT_PER_WARP, SRAM2NRAM);
-    // __nram__ unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];
+    __nram__ unsigned int *bitmask_local = &bitmask[local_warp_id * SPA_INT_PER_WARP];
     for (int i = lane_id; i < nmasks; i += WARP_SIZE)
         bitmask_local[i] = 0;
 

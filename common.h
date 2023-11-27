@@ -12,8 +12,6 @@
 #include <omp.h>
 
 #include <sys/time.h>
-//  英伟达官方库，定义半精度浮点数
-// #include "../cuda_fp16.h"
 
 #include "utils.h"
 

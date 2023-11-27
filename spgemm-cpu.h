@@ -1,6 +1,6 @@
 #include "common.h"
 
-// 在CPU上进行运算
+// Computing on CPU
 
 void step1(int *blkrowptrA, int *blkcolidxA, int blkmA, int blknA,
            int *blkcolptrB, int *blkrowidxB, int blkmB, int blknB,

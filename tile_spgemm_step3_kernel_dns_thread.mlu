@@ -79,7 +79,6 @@ __mlu_entry__ void tile_spgemm_step3_kernel_dns_thread( int *d_blkrowptrA,
             int posa = offseta;
             int posb = offsetb;
 
-            // __popc返回二进制中1的个数
             int temp = bma & bmb;
             if (popc(temp)) {
                 for (int ii = 31; ii >= 0; ii--) {
@@ -102,13 +101,13 @@ __mlu_entry__ void tile_spgemm_step3_kernel_dns_thread( int *d_blkrowptrA,
 
 
                         __memcpy(maskb, d_blkmaskB + (bbase + posb) *BLOCK_SIZE, sizeof(unsigned short) *BLOCK_SIZE, GDRAM2NRAM);
-                        // for (int ci = 0; ci < BLOCK_SIZE; ci++)
-                        //     maskb[ci] = ld_gbl_ushort(&d_blkmaskB[(bbase + posb) *BLOCK_SIZE + ci]);
+                        for (int ci = 0; ci < BLOCK_SIZE; ci++)
+                            maskb[ci] = ld_gbl_ushort(&d_blkmaskB[(bbase + posb) *BLOCK_SIZE + ci]);
 
                         for (int ni = 0; ni < nnztotala; ni++) {
                             __nram__ unsigned char rowcolidx;
                             __memcpy(&rowcolidx, d_blkcsr_Col_A + nnzastart + ni, sizeof(unsigned char), GDRAM2NRAM);
-                            // unsigned char rowcolidx = ld_gbl_uchar(d_blkcsr_Col_A + nnzastart + ni);
+                            unsigned char rowcolidx = ld_gbl_uchar(d_blkcsr_Col_A + nnzastart + ni);
                             maskc[rowcolidx >> 4] |= maskb[rowcolidx & 0xf];
                         }
                     }
@@ -141,27 +140,27 @@ __mlu_entry__ void tile_spgemm_step3_kernel_dns_thread( int *d_blkrowptrA,
             if (nnzcnt_sum <= SMEM_TNY_TH && nnzcnt_sum != 0) {
                 __nram__ int pos;
                 __bang_atomic_add(&pos, d_blksmem_tny_cnt, 1);
-                // int pos = atomicAdd(d_blksmem_tny_cnt, 1);
+                int pos = atomicAdd(d_blksmem_tny_cnt, 1);
                 d_blkid_smem_tny[pos] = tilei;
             } else if (SMEM_TNY_TH < nnzcnt_sum && nnzcnt_sum <= SMEM_SML_TH) {
                 __nram__ int pos;
                 __bang_atomic_add(&pos, d_blksmem_sml_cnt, 1);
-                // int pos = atomicAdd(d_blksmem_sml_cnt, 1);
+                int pos = atomicAdd(d_blksmem_sml_cnt, 1);
                 d_blkid_smem_sml[pos] = tilei;
             } else if (SMEM_SML_TH < nnzcnt_sum && nnzcnt_sum <= SMEM_LRG_TH) {
                 __nram__ int pos;
                 __bang_atomic_add(&pos, d_blksmem_lrg_cnt, 1);
-                // int pos = atomicAdd(d_blksmem_lrg_cnt, 1);
+                int pos = atomicAdd(d_blksmem_lrg_cnt, 1);
                 d_blkid_smem_lrg[pos] = tilei;
             } else if (SMEM_LRG_TH < nnzcnt_sum && nnzcnt_sum < SMEM_DNS_TH) {
                 __nram__ int pos;
                 __bang_atomic_add(&pos, d_blksmem_dns_cnt, 1);
-                // int pos = atomicAdd(d_blksmem_dns_cnt, 1);
+                int pos = atomicAdd(d_blksmem_dns_cnt, 1);
                 d_blkid_smem_dns[pos] = tilei;
             } else if (nnzcnt_sum == SMEM_DNS_TH) {
                 __nram__ int pos;
                 __bang_atomic_add(&pos, d_blksmem_ful_cnt, 1);
-                // int pos = atomicAdd(d_blksmem_ful_cnt, 1);
+                int pos = atomicAdd(d_blksmem_ful_cnt, 1);
                 d_blkid_smem_ful[pos] = tilei;
             }
         }

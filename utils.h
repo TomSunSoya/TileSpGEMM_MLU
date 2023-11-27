@@ -3,7 +3,7 @@
 
 #include "common.h"
 #include <omp.h>
-// 所有函数均可在CPU端运行
+// All functions could be executed on CPU.
 
 void binary_search_right_boundary_item_kernel(const MAT_PTR_TYPE *row_pointer, 
                                               const MAT_PTR_TYPE  key_input, 

@@ -1,82 +1,14 @@
-#include"common.h"
-#include"mmio_highlevel.h"
-#include"utils.h"
-//#include"../cuda/utils_cuda_scan.h"
-//#include "../spgemm_nsparse_kernel.h"
+#include "common.h"
+#include "mmio_highlevel.h"
+#include "utils.h"
 #include "csr2tile.h"
-// #include "tilespgemm-cuda.h"
-// #include "spgemm-cpu.h"
 #include "tile2csr.h"
 #include <iostream>
-//#include "../spgemm_serialref_spa_new.h"
-// #include "../cuda/spgemm_cu.h"
-#include "tilegemm_me.cpp"
+#include "tilegemm.cpp"
 #include <omp.h>
 
 int main(int argc, char ** argv)
 {
-
-	// if (argc < 6)
-    // {
-    //     printf("Run the code by './test -d 0 -aat 0 matrix.mtx'.\n");
-    //     return 0;
-    // }
-
-    // printf("--------------------------------!!!!!!!!------------------------------------\n");
-
-    // int device_id = 0;
-    // int aat = 0;
-
-    // // "Usage: ``./test -d 0 -aat 0 A.mtx'' for C=AA  on device 0", or
-    // // "Usage: ``./test -d 0 -aat 1 A.mtx'' for C=AAT on device 0"
-    // int argi = 1;
-
-    // // load device id
-    // char *devstr;
-    // if(argc > argi)
-    // {
-    //     devstr = argv[argi];
-    //     argi++;
-    // }
-
-    // if (strcmp(devstr, "-d") != 0) return 0;
-
-    // if(argc > argi)
-    // {
-    //     device_id = atoi(argv[argi]);
-    //     argi++;
-    // }
-    // printf("device_id = %i\n", device_id);
-
-    // set device
-    // cudaSetDevice(device_id);
-    // cudaDeviceProp deviceProp;
-    // cudaGetDeviceProperties(&deviceProp, device_id);
-
-    // // Set aside 50% of L2 cache for persisting accesses
-    // size_t size = min( int(deviceProp.l2CacheSize * 0.80) , deviceProp.persistingL2CacheMaxSize );
-    // cudaDeviceSetLimit( cudaLimitPersistingL2CacheSize, size);
-
-    // printf("---------------------------------------------------------------\n");
-    // printf("Device [ %i ] %s @ %4.2f MHz\n",
-    //        device_id, deviceProp.name, deviceProp.clockRate * 1e-3f);
-
-    // load AAT flag
-    // char *aatstr;
-    // if(argc > argi)
-    // {
-    //     aatstr = argv[argi];
-    //     argi++;
-    // }
-
-    // if (strcmp(aatstr, "-aat") != 0) return 0;
-
-    // if(argc > argi)
-    // {
-    //     aat = atoi(argv[argi]);
-    //     argi++;
-    // }
-
  	struct timeval t1, t2;
 	SMatrix *matrixA = (SMatrix *)malloc(sizeof(SMatrix));
 	SMatrix *matrixB = (SMatrix *)malloc(sizeof(SMatrix));
@@ -241,7 +173,7 @@ int main(int argc, char ** argv)
 
 
         // --------------------------------------------------------------------------------------------------------
-        // 分配C的基础空间
+        // Allocate memory for matrix C
         SMatrix *matrixC = (SMatrix *)malloc(sizeof(SMatrix));
 
         struct timeval tv;
@@ -251,9 +183,6 @@ int main(int argc, char ** argv)
         float gflops_tile = 0;
         float time_step1 =0,time_step2 = 0,time_step3 = 0, time_malloc = 0;
 
-
-
-        // 核心运算
         tilespgemm(matrixA,
                 matrixB,
                 matrixC,
@@ -304,31 +233,6 @@ int main(int argc, char ** argv)
         fprintf(fout_pre, "%s,%i,%i,%i,%lld,%lld,%f,%f,%f\n",
                         filename, matrixA->m, matrixA->n, matrixA->nnz, nnzCub, nnzC_computed, compression_rate, time_conversion,time_tile);
         fclose(fout_pre);
-
-
-        // printf("-------------------------------check----------------------------------------\n");
-        // tile2csr(matrixC);
-        //         printf("tile to CSR conversion complete!\n");
-
-        //     unsigned long long int nnzC = 0;
-        //     double compression_rate1 = 0;
-        //     double time_cusparse = 0;
-        //     double gflops_cusparse = 0;
-        //     int flag =0;
-        //     int mC = matrixA->m;
-        //     int nC = matrixB->n;
-        //     int nnzC_golden = matrixC->nnz;
-        //     bool check_result = CHECK_RESULT;
-
-        //     MAT_PTR_TYPE *csrRowPtrC_golden = matrixC->rowpointer;
-        //     int *csrColIdxC_golden = matrixC->columnindex;
-        //     MAT_VAL_TYPE *csrValC_golden = matrixC->value;
-
-        //     spgemm_cu(matrixA->m, matrixA->n, matrixA->nnz, matrixA->rowpointer, matrixA->columnindex, matrixA->value,
-        //             matrixB->m, matrixB->n, matrixB->nnz, matrixB->rowpointer, matrixB->columnindex, matrixB->value,
-        //             mC, nC, nnzC_golden, csrRowPtrC_golden, csrColIdxC_golden, csrValC_golden,
-        //             check_result, nnzCub, &nnzC, &compression_rate1, &time_cusparse, &gflops_cusparse);
-        //     printf("---------------------------------------------------------------\n");
         std::cout << "Please input filename: ";
     }
     matrix_destroy(matrixA);
