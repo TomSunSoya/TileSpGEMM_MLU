@@ -72,5 +72,5 @@ MLU270 is used for this project. Tailored for AI tasks, MLU270 features speciali
 
 Qiuyu Dai, Donghang Wu, Haochong Zhang, Xiangrong Liu
 
-Contact qydai@stu.xmu.edu.com or wudonghang@stu.xmu.edu.cn for any problems.
+Contact qydai@stu.xmu.edu.cn or wudonghang@stu.xmu.edu.cn for any problems.
 
